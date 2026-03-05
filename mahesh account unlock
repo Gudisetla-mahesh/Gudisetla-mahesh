@@ -1,0 +1,201 @@
+#!/bin/bash
+# =============================================================================
+# account_unlock.sh - Automate RHEL8/9/10 account unlock via faillock
+# Usage: ./account_unlock.sh -u <username> -s <server1> [server2 ... serverN]
+#        ./account_unlock.sh -u <username> -s server1,server2,server3
+# =============================================================================
+
+set -euo pipefail
+
+# ---------- Colours ----------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Colour
+
+# ---------- Defaults ----------
+SSH_USER="${SSH_USER:-$(whoami)}"
+SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes"
+MAX_PARALLEL=10
+TMPDIR_BASE=$(mktemp -d /tmp/account_unlock_XXXXXX)
+trap 'rm -rf "$TMPDIR_BASE"' EXIT
+
+# ---------- Usage ----------
+usage() {
+    echo -e "${BOLD}Usage:${NC}"
+    echo "  $0 -u <username> -s <server1> [server2 ...] [OPTIONS]"
+    echo ""
+    echo -e "${BOLD}Options:${NC}"
+    echo "  -u  <username>    Account to check/unlock (required)"
+    echo "  -s  <servers>     Space or comma-separated list of servers (required)"
+    echo "  -l  <ssh_user>    SSH login user (default: current user)"
+    echo "  -i  <identity>    SSH private key path"
+    echo "  -p  <parallel>    Max parallel jobs (default: ${MAX_PARALLEL})"
+    echo "  -h                Show this help"
+    echo ""
+    echo -e "${BOLD}Examples:${NC}"
+    echo "  $0 -u jdoe -s rhel8-srv01 rhel9-srv02 rhel10-srv03"
+    echo "  $0 -u jdoe -s rhel8-srv01,rhel9-srv02 -l admin -i ~/.ssh/id_rsa"
+    exit 0
+}
+
+# ---------- Logging ----------
+log_info()    { echo -e "${CYAN}[INFO ]${NC}  $*"; }
+log_ok()      { echo -e "${GREEN}[OK   ]${NC}  $*"; }
+log_warn()    { echo -e "${YELLOW}[WARN ]${NC}  $*"; }
+log_error()   { echo -e "${RED}[ERROR]${NC}  $*"; }
+log_section() { echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════${NC}"; \
+                echo -e "${BOLD}${CYAN}  $*${NC}"; \
+                echo -e "${BOLD}${CYAN}══════════════════════════════════════════${NC}"; }
+
+# ---------- Parse Arguments ----------
+ACCOUNT=""
+SERVERS=()
+SSH_KEY=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -u) ACCOUNT="$2"; shift 2 ;;
+        -s) shift
+            # Collect all remaining non-flag args as servers, support comma-sep too
+            while [[ $# -gt 0 && "$1" != -* ]]; do
+                IFS=',' read -ra _srv <<< "$1"
+                SERVERS+=("${_srv[@]}")
+                shift
+            done ;;
+        -l) SSH_USER="$2"; shift 2 ;;
+        -i) SSH_KEY="$2"; shift 2 ;;
+        -p) MAX_PARALLEL="$2"; shift 2 ;;
+        -h|--help) usage ;;
+        *) log_error "Unknown argument: $1"; usage ;;
+    esac
+done
+
+# ---------- Validate ----------
+[[ -z "$ACCOUNT" ]]        && { log_error "Account (-u) is required."; usage; }
+[[ ${#SERVERS[@]} -eq 0 ]] && { log_error "At least one server (-s) is required."; usage; }
+
+[[ -n "$SSH_KEY" ]] && SSH_OPTS="$SSH_OPTS -i $SSH_KEY"
+
+SSH_CMD="ssh $SSH_OPTS ${SSH_USER}@"
+
+# ---------- Per-server worker ----------
+process_server() {
+    local server="$1"
+    local account="$2"
+    local outfile="$TMPDIR_BASE/${server}.log"
+
+    {
+        echo "SERVER: $server"
+
+        # --- Check connectivity ---
+        if ! ssh $SSH_OPTS "${SSH_USER}@${server}" "echo connected" &>/dev/null; then
+            echo "STATUS: UNREACHABLE"
+            return
+        fi
+
+        # --- Check RHEL version ---
+        rhel_ver=$(ssh $SSH_OPTS "${SSH_USER}@${server}" \
+            "grep -oP '(?<=release )\d+' /etc/redhat-release 2>/dev/null || echo unknown")
+        echo "RHEL_VER: $rhel_ver"
+
+        # --- Check lock status ---
+        lock_output=$(ssh $SSH_OPTS "${SSH_USER}@${server}" \
+            "sudo faillock --user ${account} 2>&1")
+        echo "LOCK_OUTPUT:"
+        echo "$lock_output"
+
+        # Parse whether account is actually locked
+        # faillock shows failures; if count > 0 in the table it's locked
+        fail_count=$(echo "$lock_output" | awk '/^[0-9]/{sum+=$5} END{print sum+0}')
+        valid_lines=$(echo "$lock_output" | grep -cP '^\d{4}-\d{2}-\d{2}' || true)
+
+        if [[ "$valid_lines" -gt 0 ]] || [[ "$fail_count" -gt 0 ]]; then
+            echo "LOCKED: YES"
+            # --- Reset lock ---
+            reset_out=$(ssh $SSH_OPTS "${SSH_USER}@${server}" \
+                "sudo faillock --user ${account} --reset 2>&1")
+            echo "RESET_OUTPUT: $reset_out"
+
+            # Verify reset
+            verify_out=$(ssh $SSH_OPTS "${SSH_USER}@${server}" \
+                "sudo faillock --user ${account} 2>&1")
+            verify_count=$(echo "$verify_out" | grep -cP '^\d{4}-\d{2}-\d{2}' || true)
+
+            if [[ "$verify_count" -eq 0 ]]; then
+                echo "STATUS: UNLOCKED_OK"
+            else
+                echo "STATUS: UNLOCK_FAILED"
+            fi
+        else
+            echo "LOCKED: NO"
+            echo "STATUS: NOT_LOCKED"
+        fi
+    } > "$outfile" 2>&1
+}
+# ---------- Main ----------
+log_section "Account Unlock Automation"
+log_info "Account  : ${BOLD}${ACCOUNT}${NC}"
+log_info "Servers  : ${#SERVERS[@]} server(s)"
+log_info "SSH User : ${SSH_USER}"
+log_info "Parallel : ${MAX_PARALLEL}"
+echo ""
+# Run workers in parallel with max job control
+job_count=0
+for server in "${SERVERS[@]}"; do
+    process_server "$server" "$ACCOUNT" &
+    (( job_count++ ))
+    if (( job_count >= MAX_PARALLEL )); then
+        wait -n 2>/dev/null || wait   # wait for any job to finish
+        (( job_count-- ))
+    fi
+done
+wait  # wait for remaining jobs
+# ---------- Print Results ----------
+log_section "Results Summary"
+total=0; unlocked=0; not_locked=0; failed=0; unreachable=0
+for server in "${SERVERS[@]}"; do
+    outfile="$TMPDIR_BASE/${server}.log"
+    (( total++ ))
+    if [[ ! -f "$outfile" ]]; then
+        log_error "$server — no result file found"
+        (( failed++ )); continue
+    fi
+    rhel_ver=$(grep "^RHEL_VER:" "$outfile" | awk '{print $2}')
+    status=$(grep "^STATUS:" "$outfile" | awk '{print $2}')
+    locked=$(grep "^LOCKED:" "$outfile" | awk '{print $2}')
+    tag="[RHEL${rhel_ver:-?}]"
+    case "$status" in
+        UNLOCKED_OK)
+            log_ok    "${tag} ${server} — was LOCKED → successfully UNLOCKED ✔"
+            (( unlocked++ )) ;;
+        NOT_LOCKED)
+            log_info  "${tag} ${server} — account is NOT locked, no action taken"
+            (( not_locked++ )) ;;
+        UNLOCK_FAILED)
+            log_error "${tag} ${server} — account was LOCKED but RESET FAILED ✘"
+            (( failed++ )) ;;
+        UNREACHABLE)
+            log_warn  "       ${server} — UNREACHABLE (SSH failed)"
+            (( unreachable++ )) ;;
+        *)
+            log_error "       ${server} — UNKNOWN status"
+            (( failed++ )) ;;
+    esac
+done
+# ---------- Summary Table ----------
+echo ""
+echo -e "${BOLD}┌─────────────────────────────────┐${NC}"
+echo -e "${BOLD}│         FINAL SUMMARY           │${NC}"
+echo -e "${BOLD}├─────────────────────────────────┤${NC}"
+printf  "${BOLD}│${NC}  %-20s : %5d      ${BOLD}│${NC}\n" "Total Servers"   "$total"
+printf  "${GREEN}│${NC}  %-20s : %5d      ${GREEN}│${NC}\n" "Unlocked"        "$unlocked"
+printf  "${CYAN}│${NC}  %-20s : %5d      ${CYAN}│${NC}\n" "Not Locked"      "$not_locked"
+printf  "${RED}│${NC}  %-20s : %5d      ${RED}│${NC}\n" "Failed/Errors"   "$failed"
+printf  "${YELLOW}│${NC}  %-20s : %5d      ${YELLOW}│${NC}\n" "Unreachable"     "$unreachable"
+echo -e "${BOLD}└─────────────────────────────────┘${NC}"
+
+# Exit code: non-zero if any failures
+(( failed > 0 || unreachable > 0 )) && exit 1 || exit 0
